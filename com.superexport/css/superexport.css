@@ -6,9 +6,8 @@
 
 @font-face { font-family: "Unbounded"; src: url("../fonts/Unbounded-Variable.woff2") format("woff2"); font-weight: 200 900; }
 @font-face { font-family: "Geist"; src: url("../fonts/Geist-Variable.woff2") format("woff2"); font-weight: 100 900; }
-@font-face { font-family: "Cortese"; src: url("../fonts/Cortese.woff2") format("woff2"); }
-/* Números de los pasos: agrega el archivo de la fuente en /fonts con uno de estos nombres */
-@font-face { font-family: "Bemore"; src: url("../fonts/Bemore.woff2") format("woff2"), url("../fonts/Bemore.otf") format("opentype"), url("../fonts/Bemore.ttf") format("truetype"); }
+@font-face { font-family: "Fraunces"; src: url("../fonts/Fraunces-Variable.woff2") format("woff2"); font-weight: 100 900; }
+@font-face { font-family: "Imbue"; src: url("../fonts/Imbue-Variable.woff2") format("woff2"); font-weight: 100 900; }
 
 :root {
   /* Paleta base */
@@ -34,8 +33,8 @@
   /* Tipografías */
   --f-titulo: "Unbounded", "Arial Black", sans-serif;
   --f-texto: "Geist", "Segoe UI", system-ui, sans-serif;
-  --f-numeros: "Bemore", "Unbounded", "Times New Roman", serif;
-  --f-titulos: "Cortese", "Unbounded", "Times New Roman", serif;
+  --f-numeros: "Imbue", "Unbounded", "Times New Roman", serif;
+  --f-titulos: "Fraunces", "Unbounded", "Times New Roman", serif;
 
   /* Forma */
   --radio: 3px;
@@ -93,7 +92,7 @@ main::-webkit-scrollbar-thumb { background: var(--linea-fuerte); border-radius: 
 .paso { display: none; }
 .paso.activo { display: block; }
 
-/* Títulos de paso y de sección: Cortese */
+/* Títulos de paso y de sección: Fraunces */
 h2, .subtitulo { font-family: var(--f-titulos); font-weight: 400; letter-spacing: 0; text-wrap: balance; }
 h2 { font-size: 30px; line-height: 1; margin: 4px 0 6px; }
 .subtitulo {
@@ -268,3 +267,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px;
 .modal .caja-modal { background: var(--superficie); border: 1px solid var(--linea-fuerte); border-radius: var(--radio); padding: 16px; width: 100%; max-width: 340px; }
 .modal p { margin: 0 0 14px; white-space: pre-line; }
 .modal .btns { justify-content: flex-end; }
+
+/* Tipografías libres (OFL): Fraunces suave para títulos, Imbue condensada para números */
+h2, .subtitulo, .ajuste h3 { font-weight: 640; font-variation-settings: "SOFT" 100, "WONK" 0, "opsz" 72; letter-spacing: -0.01em; }
+.pasos button i, .guia li::before, .lista .num { font-variation-settings: "opsz" 100; }
