@@ -1,0 +1,1669 @@
+﻿/*
+  SuperExport — MOTOR (núcleo)
+  ---------------------------------------------------------------------
+  Este archivo NO se ejecuta solo y no aparece en el menú de Illustrator.
+  Contiene toda la lógica. Lo usa el panel SuperExport y podrá usarlo
+  cualquier interfaz futura (por ejemplo, un panel HTML diseñado por ti).
+
+  Cómo se llama desde una interfaz:
+      LP.ejecutar("nombreDeFuncion", [argumentos])
+  Devuelve siempre un texto con un objeto { ok: true/false, ... }.
+
+  Funciones disponibles (API):
+      listar()                         -> logos registrados y datos del documento
+      agregar(nombre, opcionesMesas)   -> registra lo seleccionado como logo y le crea su mesa
+      quitar(indice, opcionesMesas)    -> quita un logo de la lista (no lo borra del archivo)
+      renombrar(indice, nombre)        -> cambia el nombre del logo y de su mesa
+      mover(indice, direccion, op)     -> sube (-1) o baja (+1) un logo en el orden
+      reordenar(opcionesMesas)         -> vuelve a acomodar todas las mesas en cuadrícula
+      enfocar(indice)                  -> selecciona el logo y muestra su mesa
+      limpiarMesas()                   -> elimina las mesas que no son de ningún logo
+      exportar(config)                 -> genera el paquete de archivos
+
+  opcionesMesas = { columnas: 3, separacion: 50, margen: 10 }
+
+  SECCIONES DE ESTE ARCHIVO
+      1. Constantes
+      2. Utilidades
+      3. Registro de logos
+      4. Mesas de trabajo ordenadas
+      5. Color
+      6. Exportación
+      7. API pública
+*/
+
+$.global.LP = (function () {
+
+    // =====================================================
+    // 1. CONSTANTES
+    // =====================================================
+
+    var ETIQUETA = "SuperExport|";       // marca invisible que se guarda en cada logo (atributo "nota")
+    var ETIQUETA_ANTIGUA = "LogoPack|";  // logos registrados con versiones anteriores (se siguen reconociendo)
+    var DISTANCIA_INICIAL = 150;
+    var VERSION_MOTOR = "7.3";            // cambia cuando se actualiza el motor (para recargarlo)
+    var TAM_IMAGEN = 1200;               // PNG y JPG: px del lado más largo         // separación entre tu mesa original y la cuadrícula de logos (pt)
+
+
+    var avisos = {};
+    function avisar(txt) { avisos[txt] = true; }
+
+    // =====================================================
+    // 2. UTILIDADES
+    // =====================================================
+
+    // Documento con los logos. Si al frente está la vista previa del paquete,
+    // se usa el archivo original del que salió.
+    function docActivo() {
+        if (app.documents.length === 0) throw new Error("No hay ningún documento abierto en Illustrator.");
+        var d = app.activeDocument;
+        if (!esVista(d)) return d;
+        var nombre = origenDeVista(d);
+        for (var i = 0; i < app.documents.length; i++) {
+            if (app.documents[i].name === nombre && !esVista(app.documents[i])) return app.documents[i];
+        }
+        throw new Error("No encuentro el archivo original (" + nombre + "). Ábrelo de nuevo.");
+    }
+
+    function traerAlFrente(d) {
+        try { if (esVista(app.activeDocument)) app.activeDocument = d; } catch (e) {}
+    }
+
+    function limpiar(s) {
+        return String(s || "")
+            .replace(/^\s+|\s+$/g, "")
+            .replace(/^<.*>$/, "")
+            .replace(/[\\\/:\*\?"<>\|]/g, "-")
+            .replace(/\s+/g, "_");
+    }
+
+    function dosDigitos(n) { return (n < 10 ? "0" : "") + n; }
+
+    function opcionesPorDefecto(op) {
+        op = op || {};
+        return {
+            columnas: Math.max(1, parseInt(op.columnas, 10) || 3),
+            separacion: Math.max(0, parseFloat(op.separacion) || 50),
+            // Cada mesa de trabajo tiene la forma exacta de su logo: sin margen y sin tamaño común
+            margen: 0,
+            mismoTamano: false
+        };
+    }
+
+    // Límites visibles reales de un objeto (respeta máscaras de recorte)
+    // Límites visibles de un objeto. Solo mira dentro del grupo si tiene máscara de recorte
+    // (recorrer cada trazado de un logo complejo es muy lento en Illustrator).
+    function limites(it) {
+        if (it.typename === "GroupItem" && it.clipped) {
+            var hijos = it.pageItems;
+            for (var i = 0; i < hijos.length; i++) {
+                var h = hijos[i];
+                if ((h.typename === "PathItem" && h.clipping) ||
+                    (h.typename === "CompoundPathItem" && h.pathItems.length && h.pathItems[0].clipping)) {
+                    return h.geometricBounds;
+                }
+            }
+        }
+        return it.visibleBounds;
+    }
+
+    function unir(a, b) {
+        if (!a) return [b[0], b[1], b[2], b[3]];
+        return [Math.min(a[0], b[0]), Math.max(a[1], b[1]), Math.max(a[2], b[2]), Math.min(a[3], b[3])];
+    }
+
+    function conMargen(b, margen) {
+        var m = Math.max(b[2] - b[0], b[1] - b[3]) * margen / 100;
+        return [b[0] - m, b[1] + m, b[2] + m, b[3] - m];
+    }
+
+    function crearCarpeta(ruta) {
+        var f = new Folder(ruta);
+        if (!f.exists) f.create();
+        return f;
+    }
+
+    function buscarMesa(d, nombre) {
+        for (var i = 0; i < d.artboards.length; i++) {
+            if (d.artboards[i].name === nombre) return i;
+        }
+        return -1;
+    }
+
+    function nivelSuperior(it) {
+        while (it.parent && it.parent.typename !== "Layer") it = it.parent;
+        return it;
+    }
+
+    // =====================================================
+    // 3. REGISTRO DE LOGOS
+    //    Cada logo es un grupo con una "nota" invisible:
+    //    SuperExport|orden|origenX|origenY
+    // =====================================================
+
+    function esEtiqueta(nota) { return nota.indexOf(ETIQUETA) === 0 || nota.indexOf(ETIQUETA_ANTIGUA) === 0; }
+
+    function esLogo(it) {
+        try { return it.typename === "GroupItem" && esEtiqueta(String(it.note)); }
+        catch (e) { return false; }
+    }
+
+    // Busca los logos registrados solo entre los objetos de primer nivel de cada capa
+    // (no en todos los grupos del documento, que en una mascota pueden ser cientos)
+    function logosDe(d) {
+        var res = [];
+        function revisarCapa(capa) {
+            var items = capa.pageItems;
+            for (var i = 0; i < items.length; i++) {
+                var it = items[i];
+                if (it.typename !== "GroupItem") continue;
+                var nota = "";
+                try { nota = String(it.note); } catch (e) {}
+                if (!esEtiqueta(nota)) continue;
+                res.push({ item: it, orden: parseFloat(nota.split("|")[1]) || 9999 });
+            }
+            for (var s = 0; s < capa.layers.length; s++) revisarCapa(capa.layers[s]);
+        }
+        for (var l = 0; l < d.layers.length; l++) revisarCapa(d.layers[l]);
+        res.sort(function (a, b) { return a.orden - b.orden; });
+        var lista = [];
+        for (var k = 0; k < res.length; k++) lista.push(res[k].item);
+        return lista;
+    }
+
+    function leerOrigen(lista) {
+        for (var i = 0; i < lista.length; i++) {
+            var p = String(lista[i].note).split("|");
+            if (p.length >= 4 && !isNaN(parseFloat(p[2])) && !isNaN(parseFloat(p[3]))) {
+                return [parseFloat(p[2]), parseFloat(p[3])];
+            }
+        }
+        return null;
+    }
+
+    // La cuadrícula empieza debajo de todas las mesas de trabajo que ya existen
+    function calcularOrigen(d) {
+        var izq = null, abajo = null;
+        for (var i = 0; i < d.artboards.length; i++) {
+            var r = d.artboards[i].artboardRect;
+            izq = (izq === null) ? r[0] : Math.min(izq, r[0]);
+            abajo = (abajo === null) ? r[3] : Math.min(abajo, r[3]);
+        }
+        return [izq, abajo - DISTANCIA_INICIAL];
+    }
+
+    function escribirNotas(lista, origen) {
+        for (var i = 0; i < lista.length; i++) {
+            lista[i].note = ETIQUETA + (i + 1) + "|" + origen[0] + "|" + origen[1];
+        }
+    }
+
+    function nombreLibre(lista, base, excepto) {
+        var usados = {};
+        for (var i = 0; i < lista.length; i++) {
+            if (lista[i] !== excepto) usados[String(lista[i].name).toLowerCase()] = true;
+        }
+        var nom = base, n = 2;
+        while (usados[nom.toLowerCase()]) { nom = base + "_" + n; n++; }
+        return nom;
+    }
+
+    function resumenLista(d) {
+        var lista = logosDe(d), nombres = [];
+        for (var i = 0; i < lista.length; i++) nombres.push(lista[i].name);
+        var carpeta = Folder.desktop.fsName;
+        try { if (d.saved && d.path && d.path.exists) carpeta = d.path.fsName; } catch (e) {}
+        return { documento: d.name.replace(/\.[^\.]+$/, ""), carpeta: carpeta, logos: nombres };
+    }
+
+    // =====================================================
+    // 4. MESAS DE TRABAJO ORDENADAS
+    //    Todos los logos se acomodan en una cuadrícula con celdas
+    //    del mismo tamaño; cada mesa queda ajustada a su logo y
+    //    centrada en su celda, así nunca se superponen.
+    // =====================================================
+
+    function acomodar(d, lista, origen, op) {
+        if (!lista.length) return;
+
+        // Cada columna mide lo que su logo más ancho y cada fila lo que su logo más alto,
+        // así la separación entre mesas es pareja. Cada mesa = forma exacta de su logo.
+        var datos = [], anchoCol = [], altoFila = [], i;
+        for (i = 0; i < lista.length; i++) {
+            var b = limites(lista[i]);
+            var w = b[2] - b[0], h = b[1] - b[3];
+            var c = i % op.columnas, f = Math.floor(i / op.columnas);
+            datos.push({ b: b, aw: w, ah: h });
+            anchoCol[c] = Math.max(anchoCol[c] || 0, w);
+            altoFila[f] = Math.max(altoFila[f] || 0, h);
+        }
+        var xCol = [], yFila = [];
+        for (i = 0; i < anchoCol.length; i++) xCol[i] = (i === 0) ? origen[0] : xCol[i - 1] + anchoCol[i - 1] + op.separacion;
+        for (i = 0; i < altoFila.length; i++) yFila[i] = (i === 0) ? origen[1] : yFila[i - 1] - altoFila[i - 1] - op.separacion;
+
+        // Mesas anteriores de estos logos (se reemplazan para mantener el orden)
+        var nombres = {}, viejas = [];
+        for (i = 0; i < lista.length; i++) nombres[lista[i].name] = true;
+        for (i = 0; i < d.artboards.length; i++) {
+            if (nombres[d.artboards[i].name]) viejas.push(i);
+        }
+
+        for (i = 0; i < lista.length; i++) {
+            var col = i % op.columnas;
+            var fila = Math.floor(i / op.columnas);
+            // Esquina superior izquierda de la mesa; el logo se coloca justo ahí
+            var x = xCol[col], y = yFila[fila];
+            var bb = datos[i].b;
+            lista[i].translate(x - bb[0], y - bb[1]);
+            var r = [x, y, x + datos[i].aw, y - datos[i].ah];
+            var ab = d.artboards.add(r);
+            ab.name = lista[i].name;
+        }
+
+        for (i = viejas.length - 1; i >= 0; i--) {
+            if (d.artboards.length > 1) d.artboards.remove(viejas[i]);
+        }
+    }
+
+    // =====================================================
+    // 5. COLOR
+    //    Cada versión de color es una receta:
+    //    { nombre, tipo: "mapa" | "grises", regla, fondo: "claro" | "oscuro",
+    //      mapa: [[claveColorOriginal, destino], ...] }
+    //    destino = "mantener" | "negro" | "blanco" | "quitar" | "P:<claveColor>"
+    //    regla = qué hacer con los colores que no están en el mapa:
+    //      "mantener" | "tinta" (oscuros→negro, claros→blanco)
+    //      "tintaBlanca" (oscuros→blanco, claros→quitar) | "todoNegro" | "todoBlanco"
+    // =====================================================
+
+    function crearColores(esCMYK) {
+        var C = {};
+        C.negro = function () {
+            if (esCMYK) { var k = new CMYKColor(); k.black = 100; return k; }
+            return new RGBColor();
+        };
+        C.blanco = function () {
+            if (esCMYK) return new CMYKColor();
+            var w = new RGBColor(); w.red = 255; w.green = 255; w.blue = 255;
+            return w;
+        };
+        C.fondoOscuro = function () {
+            if (esCMYK) { var k = new CMYKColor(); k.black = 85; return k; }
+            var g = new RGBColor(); g.red = 38; g.green = 38; g.blue = 38;
+            return g;
+        };
+        C.fondoClaro = function () {
+            if (esCMYK) { var k = new CMYKColor(); k.black = 5; return k; }
+            var g = new RGBColor(); g.red = 242; g.green = 242; g.blue = 242;
+            return g;
+        };
+        return C;
+    }
+
+    function r1(n) { return Math.round(n); }
+
+    // Identificador único de un color, para reconocerlo en todos los logos
+    function claveColor(c) {
+        if (!c) return null;
+        switch (c.typename) {
+            case "RGBColor":  return "RGB:" + r1(c.red) + "," + r1(c.green) + "," + r1(c.blue);
+            case "CMYKColor": return "CMYK:" + r1(c.cyan) + "," + r1(c.magenta) + "," + r1(c.yellow) + "," + r1(c.black);
+            case "GrayColor": return "GRAY:" + r1(c.gray);
+            case "SpotColor": return "SPOT:" + c.spot.name + "|" + r1(c.tint);
+            case "LabColor":  return "LAB:" + r1(c.l) + "," + r1(c.a) + "," + r1(c.b);
+        }
+        return null;
+    }
+
+    function hex2(n) {
+        n = Math.max(0, Math.min(255, Math.round(n)));
+        return (n < 16 ? "0" : "") + n.toString(16).toUpperCase();
+    }
+
+    // Color aproximado en pantalla (HEX) para mostrarlo en el panel
+    function hexDe(c) {
+        switch (c.typename) {
+            case "RGBColor": return hex2(c.red) + hex2(c.green) + hex2(c.blue);
+            case "CMYKColor":
+                var k = 1 - c.black / 100;
+                return hex2(255 * (1 - c.cyan / 100) * k) + hex2(255 * (1 - c.magenta / 100) * k) +
+                       hex2(255 * (1 - c.yellow / 100) * k);
+            case "GrayColor": var g = 255 * (1 - c.gray / 100); return hex2(g) + hex2(g) + hex2(g);
+            case "SpotColor":
+                var base = hexDe(c.spot.color), t = c.tint / 100, s = "";
+                for (var i = 0; i < 3; i++) {
+                    var v = parseInt(base.substr(i * 2, 2), 16);
+                    s += hex2(255 - (255 - v) * t);
+                }
+                return s;
+            case "LabColor": var l = 255 * c.l / 100; return hex2(l) + hex2(l) + hex2(l);
+        }
+        return "888888";
+    }
+
+    function nombreColor(c) {
+        if (c.typename === "SpotColor") return c.spot.name + (c.tint < 100 ? " " + r1(c.tint) + "%" : "");
+        if (c.typename === "CMYKColor") return "C" + r1(c.cyan) + " M" + r1(c.magenta) + " Y" + r1(c.yellow) + " K" + r1(c.black);
+        return "#" + hexDe(c);
+    }
+
+    // Crea un color de Illustrator a partir de su clave (o de un HEX)
+    function colorDesdeClave(clave, doc) {
+        var p = String(clave).split(":"), tipo = p[0], v = p.slice(1).join(":");
+        var n = v.split(","), c;
+        if (tipo === "HEX") {
+            c = new RGBColor();
+            c.red = parseInt(v.substr(0, 2), 16); c.green = parseInt(v.substr(2, 2), 16); c.blue = parseInt(v.substr(4, 2), 16);
+            return c;
+        }
+        if (tipo === "RGB") { c = new RGBColor(); c.red = +n[0]; c.green = +n[1]; c.blue = +n[2]; return c; }
+        if (tipo === "CMYK") { c = new CMYKColor(); c.cyan = +n[0]; c.magenta = +n[1]; c.yellow = +n[2]; c.black = +n[3]; return c; }
+        if (tipo === "GRAY") { c = new GrayColor(); c.gray = +n[0]; return c; }
+        if (tipo === "LAB") { c = new LabColor(); c.l = +n[0]; c.a = +n[1]; c.b = +n[2]; return c; }
+        if (tipo === "SPOT") {
+            var partes = v.split("|");
+            try {
+                c = new SpotColor();
+                c.spot = doc.spots.getByName(partes[0]);
+                c.tint = +partes[1] || 100;
+                return c;
+            } catch (e) {}
+            // La tinta plana no existe en este documento: se usa su color equivalente
+            for (var i = 0; i < app.documents.length; i++) {
+                try { return app.documents[i].spots.getByName(partes[0]).color; } catch (e2) {}
+            }
+        }
+        return null;
+    }
+
+    // Recorre todos los trazados de un objeto (también dentro de grupos y trazados compuestos)
+    function recorrerTrazados(it, fn) {
+        switch (it.typename) {
+            case "GroupItem":
+                for (var i = 0; i < it.pageItems.length; i++) recorrerTrazados(it.pageItems[i], fn);
+                break;
+            case "CompoundPathItem":
+                for (var j = 0; j < it.pathItems.length; j++) fn(it.pathItems[j]);
+                break;
+            case "PathItem":
+                fn(it);
+                break;
+            case "TextFrame":
+                fn(null, it);
+                break;
+        }
+    }
+
+    // Lista de colores distintos que usa un logo
+    function detectarColores(item) {
+        var vistos = {}, lista = [];
+        function anotar(c) {
+            if (!c) return;
+            if (c.typename === "GradientColor") {
+                var st = c.gradient.gradientStops;
+                for (var s = 0; s < st.length; s++) anotar(st[s].color);
+                return;
+            }
+            var k = claveColor(c);
+            if (!k || vistos[k]) return;
+            vistos[k] = true;
+            lista.push({ clave: k, hex: hexDe(c), nombre: nombreColor(c), gris: valorGris(c) });
+        }
+        recorrerTrazados(item, function (p, texto) {
+            if (texto) {
+                try {
+                    var ch = texto.textRange.characters;
+                    for (var t = 0; t < ch.length; t++) anotar(ch[t].characterAttributes.fillColor);
+                } catch (e) {}
+                return;
+            }
+            if (p.guides || p.clipping) return;
+            try { if (p.filled) anotar(p.fillColor); } catch (e1) {}
+            try { if (p.stroked) anotar(p.strokeColor); } catch (e2) {}
+        });
+        // Ordenados de oscuro a claro
+        lista.sort(function (a, b) { return b.gris - a.gris; });
+        return lista;
+    }
+
+    // Qué destino le toca a un color en una versión
+    function destinoPara(ver, c) {
+        var k = claveColor(c);
+        var mapa = ver.mapa || [];
+        for (var i = 0; i < mapa.length; i++) {
+            if (mapa[i][0] === k) return mapa[i][1];
+        }
+        var gris = valorGris(c), oscuro = gris >= 50;
+        switch (ver.regla) {
+            // Una tinta negra: todo lo que tiene color pasa a negro; lo blanco (o casi) se queda blanco
+            case "tinta":       return gris > 8 ? "negro" : "blanco";
+            // Blanco sobre fondo oscuro: sigue al esquema Negro. Lo que allí es negro pasa a blanco
+            // y lo que allí es blanco pasa al color del fondo (así se conservan bordes y separaciones)
+            case "tintaBlanca":
+                var dn = destinoBase(ver, c);
+                return dn === "negro" ? "blanco" : (dn === "blanco" ? "fondo" : dn);
+            // Invertida: negros a blanco, blancos al fondo, los colores de marca se quedan
+            case "invertida":   return gris >= 80 ? "blanco" : (gris <= 8 ? "fondo" : "mantener");
+            // Una tinta en un color de la marca: sigue al esquema Negro, cambiando el negro por ese color
+            case "tintaColor":
+                var dt = destinoBase(ver, c);
+                return dt === "negro" ? (ver.tinta || "negro") : dt;
+            case "todoNegro":   return "negro";
+            case "todoBlanco":  return "blanco";
+        }
+        return "mantener";
+    }
+
+    // Resultado que tendría el color en el esquema Negro (guía de las versiones de una tinta)
+    function destinoBase(ver, c) {
+        var regla = ver.baseRegla || "tinta";
+        if (regla === "tintaBlanca" || regla === "tintaColor") regla = "tinta";
+        return destinoPara({ regla: regla, mapa: ver.baseMapa || [] }, c);
+    }
+
+    // Color de fondo de una versión: de marca, oscuro o blanco
+    function fondoDe(ver, doc, C) {
+        if (ver && ver.fondoColor) {
+            var c = colorDesdeClave(String(ver.fondoColor).replace(/^P:/, ""), doc);
+            if (c) return c;
+        }
+        return (ver && ver.fondo === "oscuro") ? C.fondoOscuro() : C.blanco();
+    }
+
+    // Versiones extra solo para JPG: el logo sobre cada fondo de color de marca elegido.
+    // Sobre fondos oscuros va en tinta blanca; sobre claros, en negro. Los huecos toman el color del fondo.
+    function versionesDeFondo(cfg) {
+        var r = [], f = cfg.fondosJPG || [];
+        if (!cfg.formatos || !cfg.formatos.JPG) return r;
+        for (var i = 0; i < f.length; i++) {
+            var oscuro = (f[i].gris >= 45);
+            r.push({ nombre: "Fondo_" + String(f[i].hex).toUpperCase(), tipo: "tinta",
+                     tinta: oscuro ? "blanco" : "negro", papel: "fondo", fondo: oscuro ? "oscuro" : "claro",
+                     fondoColor: "P:" + f[i].clave, regla: "mantener", mapa: [], soloJPG: true });
+        }
+        return r;
+    }
+
+    function colorDestino(destino, doc, C, ver) {
+        if (destino === "fondo") return fondoDe(ver, doc, C);
+        if (destino === "negro") return C.negro();
+        if (destino === "blanco") return C.blanco();
+        if (String(destino).indexOf("P:") === 0) return colorDesdeClave(destino.substr(2), doc);
+        return null;
+    }
+
+    // =====================================================
+    // 5.1 UNA TINTA POR CONTRASTE
+    //     Decide cada forma según lo que tiene debajo, no según su color:
+    //     · lo que va directo sobre el fondo se pinta con la tinta
+    //     · lo que va encima de una forma de otro color se pinta en contraste (hueco)
+    //     · lo que va encima de una forma del mismo color sigue su tono
+    //     Así un mismo color puede ser tinta en un lugar y hueco en otro
+    //     (por ejemplo, el naranja de la mano y el naranja del "03").
+    // =====================================================
+
+    function recolectarFormas(it, out) {
+        try { if (it.hidden) return; } catch (e) {}
+        switch (it.typename) {
+            case "GroupItem":
+                // De abajo hacia arriba
+                for (var i = it.pageItems.length - 1; i >= 0; i--) recolectarFormas(it.pageItems[i], out);
+                break;
+            case "CompoundPathItem":
+                if (!it.pathItems.length) return;
+                var p0 = it.pathItems[0];
+                if (p0.clipping) return;
+                out.push({ item: it, tipo: "compuesto", b: it.visibleBounds,
+                           fill: p0.filled ? p0.fillColor : null, stroke: p0.stroked ? p0.strokeColor : null });
+                break;
+            case "PathItem":
+                if (it.guides || it.clipping) return;
+                out.push({ item: it, tipo: "trazado", b: it.visibleBounds,
+                           fill: it.filled ? it.fillColor : null, stroke: it.stroked ? it.strokeColor : null });
+                break;
+            case "TextFrame":
+                var c = null;
+                try { c = it.textRange.characters[0].characterAttributes.fillColor; } catch (e2) {}
+                out.push({ item: it, tipo: "texto", b: it.visibleBounds, fill: c, stroke: null });
+                break;
+        }
+    }
+
+    function esColor(c) {
+        return c && c.typename !== "NoColor" && c.typename !== "PatternColor";
+    }
+
+    function grisDe(c) {
+        if (c.typename === "GradientColor") {
+            var st = c.gradient.gradientStops, t = 0;
+            for (var i = 0; i < st.length; i++) t += valorGris(st[i].color);
+            return st.length ? t / st.length : 0;
+        }
+        return valorGris(c);
+    }
+
+    function claveDe(c) {
+        if (c.typename === "GradientColor") return "GRAD:" + c.gradient.name;
+        return claveColor(c);
+    }
+
+    function aplicarTinta(g, ver, C, doc) {
+        var colTinta = colorDestino(ver.tinta || "negro", doc, C, ver) || C.negro();
+        var colPapel = colorDestino(ver.papel || "blanco", doc, C, ver) || C.blanco();
+        var formas = [];
+        recolectarFormas(g, formas);
+        var T = 0.5; // tolerancia en puntos
+
+        for (var i = 0; i < formas.length; i++) {
+            var f = formas[i];
+            f.clave = esColor(f.fill) ? claveDe(f.fill) : null;
+            var cont = contenedor(i);
+            f.tono = esColor(f.fill) ? tono(f.fill, f.clave, cont) : null;
+            f.tonoBorde = esColor(f.stroke) ? tono(f.stroke, claveDe(f.stroke), cont) : null;
+        }
+        for (var k = 0; k < formas.length; k++) pintar(formas[k]);
+
+        // La forma con relleno más cercana por debajo que contiene a esta
+        function contenedor(i) {
+            var b = formas[i].b;
+            for (var j = i - 1; j >= 0; j--) {
+                var c = formas[j];
+                if (!c.tono) continue;
+                var cb = c.b;
+                if (b[0] >= cb[0] - T && b[2] <= cb[2] + T && b[1] <= cb[1] + T && b[3] >= cb[3] - T) return c;
+            }
+            return null;
+        }
+
+        function tono(color, clave, cont) {
+            if (!cont) return grisDe(color) > 8 ? "tinta" : "papel";
+            if (clave && clave === cont.clave) return cont.tono;
+            return cont.tono === "tinta" ? "papel" : "tinta";
+        }
+
+        function pintar(f) {
+            var cf = f.tono ? (f.tono === "tinta" ? colTinta : colPapel) : null;
+            var cs = f.tonoBorde ? (f.tonoBorde === "tinta" ? colTinta : colPapel) : null;
+            try {
+                if (f.tipo === "compuesto") {
+                    for (var p = 0; p < f.item.pathItems.length; p++) {
+                        var pi = f.item.pathItems[p];
+                        if (cf && pi.filled) pi.fillColor = cf;
+                        if (cs && pi.stroked) pi.strokeColor = cs;
+                    }
+                } else if (f.tipo === "texto") {
+                    if (cf) f.item.textRange.characterAttributes.fillColor = cf;
+                } else {
+                    if (cf) f.item.fillColor = cf;
+                    if (cs) f.item.strokeColor = cs;
+                }
+            } catch (e) {}
+        }
+    }
+
+    // Aplica una versión de color a un grupo (en dos fases: primero calcula todo
+    // a partir de los colores originales y luego aplica, para no cambiar nada dos veces)
+    function aplicarEnGrupo(g, ver, C, doc) {
+        if (!ver || ver.tipo === "original") return;
+        if (ver.tipo === "tinta") { aplicarTinta(g, ver, C, doc); return; }
+        var esGris = (ver.tipo === "grises");
+        var trazados = [], textos = [], cache = {};
+
+        recorrerTrazados(g, function (p, texto) {
+            if (texto) { textos.push(texto); return; }
+            if (p.guides || p.clipping) return;
+            var nf = null, ns = null;
+            try { if (p.filled) nf = nuevoColor(p.fillColor); } catch (e) {}
+            try { if (p.stroked) ns = nuevoColor(p.strokeColor); } catch (e2) {}
+            trazados.push([p, nf, ns]);
+        });
+
+        var letras = [];
+        for (var t = 0; t < textos.length; t++) {
+            try {
+                var ch = textos[t].textRange.characters;
+                for (var c = 0; c < ch.length; c++) letras.push([ch[c], nuevoColor(ch[c].characterAttributes.fillColor)]);
+            } catch (e3) {}
+        }
+
+        for (var i = 0; i < trazados.length; i++) {
+            var p = trazados[i][0], f = trazados[i][1], s = trazados[i][2];
+            try { if (f === "quitar") p.filled = false; else if (f) p.fillColor = f; } catch (e4) {}
+            try { if (s === "quitar") p.stroked = false; else if (s) p.strokeColor = s; } catch (e5) {}
+        }
+        for (var k = 0; k < letras.length; k++) {
+            try {
+                if (letras[k][1] === "quitar") letras[k][0].characterAttributes.fillColor = new NoColor();
+                else if (letras[k][1]) letras[k][0].characterAttributes.fillColor = letras[k][1];
+            } catch (e6) {}
+        }
+
+        // Devuelve: un color nuevo, "quitar", o null (= dejar igual)
+        function nuevoColor(c) {
+            if (!c || c.typename === "NoColor" || c.typename === "PatternColor") return null;
+            if (c.typename === "GradientColor") return gradienteNuevo(c);
+            if (esGris) return aGris(c);
+            // Memoria por color: cada color distinto se resuelve una sola vez
+            var k = claveColor(c);
+            if (k && cache.hasOwnProperty(k)) return cache[k];
+            var d = destinoPara(ver, c), r;
+            if (d === "mantener") r = null;
+            else if (d === "quitar") r = "quitar";
+            else r = colorDestino(d, doc, C, ver);
+            if (k) cache[k] = r;
+            return r;
+        }
+
+        // Los degradados se copian antes de cambiarlos, para no afectar a otras copias del logo
+        function gradienteNuevo(gc) {
+            try {
+                var orig = gc.gradient, ng = doc.gradients.add();
+                ng.type = orig.type;
+                while (ng.gradientStops.length < orig.gradientStops.length) ng.gradientStops.add();
+                for (var s = 0; s < orig.gradientStops.length; s++) {
+                    var os = orig.gradientStops[s], ns = ng.gradientStops[s];
+                    ns.rampPoint = os.rampPoint;
+                    ns.midPoint = os.midPoint;
+                    try { ns.opacity = os.opacity; } catch (eO) {}
+                    var col = os.color;
+                    if (esGris) col = aGris(col);
+                    else {
+                        var d = destinoPara(ver, os.color);
+                        if (d === "quitar") { try { ns.opacity = 0; } catch (eQ) {} }
+                        else if (d !== "mantener") col = colorDestino(d, doc, C, ver) || col;
+                    }
+                    ns.color = col;
+                }
+                var nc = new GradientColor();
+                nc.gradient = ng;
+                try { nc.angle = gc.angle; nc.origin = gc.origin; nc.length = gc.length; } catch (eG) {}
+                return nc;
+            } catch (e) {
+                avisar("Un degradado no se pudo cambiar de color.");
+                return null;
+            }
+        }
+    }
+
+    function aGris(c) {
+        if (!c || c.typename === "NoColor" || c.typename === "PatternColor") return c;
+        if (c.typename === "GradientColor") {
+            var stops = c.gradient.gradientStops;
+            for (var j = 0; j < stops.length; j++) stops[j].color = aGris(stops[j].color);
+            return c;
+        }
+        var g = new GrayColor();
+        g.gray = Math.max(0, Math.min(100, valorGris(c)));
+        return g;
+    }
+
+    // 0 = blanco, 100 = negro
+    function valorGris(c) {
+        switch (c.typename) {
+            case "GrayColor": return c.gray;
+            case "RGBColor": return luminancia(c.red, c.green, c.blue);
+            case "CMYKColor":
+                var k = 1 - c.black / 100;
+                return luminancia(255 * (1 - c.cyan / 100) * k,
+                                  255 * (1 - c.magenta / 100) * k,
+                                  255 * (1 - c.yellow / 100) * k);
+            case "LabColor": return 100 - c.l;
+            case "SpotColor": return valorGris(c.spot.color) * c.tint / 100;
+        }
+        return 0;
+    }
+
+    function luminancia(r, g, b) {
+        return (1 - (0.299 * r + 0.587 * g + 0.114 * b) / 255) * 100;
+    }
+
+    // =====================================================
+    // 6. EXPORTACIÓN
+    // =====================================================
+
+    function exportarPaquete(src, cfg) {
+        var esCMYK = (src.documentColorSpace === DocumentColorSpace.CMYK);
+        var C = crearColores(esCMYK);
+        var lista = logosDe(src);
+        if (!lista.length) throw new Error("Todavía no hay logos en la lista. Agrégalos en el paso 1.");
+
+        cfg.margen = 0;   // el logo toca los bordes de su mesa
+        var variantes = normalizarVersiones(cfg);
+
+        var carpetaBase = new Folder(cfg.carpeta);
+        if (!carpetaBase.exists) carpetaBase = Folder.desktop;
+        var raiz = crearCarpeta(carpetaBase.fsName + "/" + (limpiar(cfg.nombre) || "Logo") + "_Logo");
+        var marca = limpiar(cfg.nombre) || "Logo";
+        var total = 0;
+
+        var nivelAlertas = app.userInteractionLevel;
+        app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
+
+        // Un solo documento de trabajo para todos los archivos (crear documentos es lo más lento)
+        var hayIndividuales = false;
+        for (var fk in cfg.formatos) if (cfg.formatos[fk]) hayIndividuales = true;
+        var tdoc = null;
+
+        try {
+            if (hayIndividuales) tdoc = app.documents.add(src.documentColorSpace, 500, 500);
+            for (var l = 0; hayIndividuales && l < lista.length; l++) {
+                var logo = { nombre: limpiar(lista[l].name) || ("Logo_" + dosDigitos(l + 1)), item: lista[l] };
+                var todas = variantes.concat(versionesDeFondo(cfg));
+                for (var v = 0; v < todas.length; v++) {
+                    try {
+                        total += generarVariante(tdoc, logo, todas[v]);
+                    } catch (eVar) {
+                        avisar(logo.nombre + " (" + todas[v].nombre + "): " + eVar.message +
+                               (eVar.line ? " [línea " + eVar.line + "]" : ""));
+                    }
+                }
+            }
+
+            if (tdoc) { tdoc.close(SaveOptions.DONOTSAVECHANGES); tdoc = null; }
+
+            // Archivo maestro = la vista previa del paquete, guardada (sin la capa interna "Base")
+            if (cfg.maestroAI || cfg.maestroPDF) {
+                try {
+                    var vp = construirVistaPaquete(src, cfg);
+                    var cb = capaPorPrefijo(vp.doc, PREFIJO_BASE);
+                    if (cb) { cb.locked = false; cb.visible = true; cb.remove(); }
+                    if (cfg.maestroAI) { vp.doc.saveAs(new File(raiz.fsName + "/" + marca + "_Maestro.ai"), opcionesAI()); total++; }
+                    if (cfg.maestroPDF) { vp.doc.saveAs(new File(raiz.fsName + "/" + marca + "_Todos_los_logos.pdf"), opcionesPDF()); total++; }
+                } catch (eM) {
+                    avisar("Archivo maestro: " + eM.message);
+                }
+            }
+        } finally {
+            if (tdoc) { try { tdoc.close(SaveOptions.DONOTSAVECHANGES); } catch (eC) {} }
+            app.userInteractionLevel = nivelAlertas;
+        }
+
+        try { if (total > 0) raiz.execute(); } catch (eX) {}
+        return { total: total, carpeta: raiz.fsName };
+
+        // ---------- 6.1 Variante individual ----------
+        function generarVariante(doc, logo, v) {
+            vaciarDocumento(doc);
+            var grupo = copiarConVersion(logo.item, doc.layers[0], v, C, doc, cfg.contornos);
+            grupo.name = logo.nombre + " " + v.nombre;
+            ajustarMesa(doc, grupo);
+            doc.artboards[0].name = logo.nombre + "_" + v.nombre;
+            return exportarFormatos(doc, grupo, logo, v);
+        }
+
+        function ajustarMesa(doc, grupo) {
+            doc.artboards[0].artboardRect = conMargen(limites(grupo), cfg.margen);
+        }
+
+        function ladoMayor(doc) {
+            var r = doc.artboards[0].artboardRect;
+            return Math.max(r[2] - r[0], r[1] - r[3]);
+        }
+
+        function escalar(doc, grupo, k) {
+            grupo.resize(k * 100, k * 100, true, true, true, true, k * 100, Transformation.CENTER);
+            ajustarMesa(doc, grupo);
+        }
+
+        // ---------- 6.2 Formatos ----------
+        function exportarFormatos(doc, grupo, logo, v) {
+            var n = 0, f = cfg.formatos;
+            var base = marca + "_" + logo.nombre + "_" + v.nombre;
+            if (v.soloJPG) f = { JPG: true };   // versiones de fondo de marca: solo JPG
+
+            if (f.AI)  { doc.saveAs(archivo(logo, "AI",  base + ".ai"),  opcionesAI());  n++; }
+            if (f.EPS) { doc.saveAs(archivo(logo, "EPS", base + ".eps"), opcionesEPS()); n++; }
+            if (f.PDF) { doc.saveAs(archivo(logo, "PDF", base + ".pdf"), opcionesPDF()); n++; }
+            if (f.SVG) { doc.exportFile(archivo(logo, "SVG", base + ".svg"), ExportType.SVG, opcionesSVG()); n++; }
+            if (f.PNG) {
+                exportarRaster(doc, grupo, archivo(logo, "PNG", base + ".png"), TAM_IMAGEN, "png", null);
+                n++;
+            }
+            if (f.JPG) {
+                exportarRaster(doc, grupo, archivo(logo, "JPG", base + ".jpg"), TAM_IMAGEN, "jpg", fondoDe(v, doc, C));
+                n++;
+            }
+            return n;
+        }
+
+        function exportarRaster(doc, grupo, file, px, tipo, colorFondo) {
+            // Illustrator limita la escala de exportación (~776 %): si hace falta más, se agranda el arte temporalmente
+            var escala = px / ladoMayor(doc) * 100, k = 1;
+            if (escala > 700) {
+                k = escala / 700;
+                escalar(doc, grupo, k);
+                escala = px / ladoMayor(doc) * 100;
+            }
+            var capaFondo = null;
+            if (colorFondo) {
+                var r = doc.artboards[0].artboardRect;
+                capaFondo = doc.layers.add();
+                capaFondo.zOrder(ZOrderMethod.SENDTOBACK);
+                var rect = capaFondo.pathItems.rectangle(r[1], r[0], r[2] - r[0], r[1] - r[3]);
+                rect.stroked = false;
+                rect.filled = true;
+                rect.fillColor = colorFondo;
+            }
+            try {
+                if (tipo === "png") {
+                    var o = new ExportOptionsPNG24();
+                    o.transparency = true;
+                    o.antiAliasing = true;
+                    o.artBoardClipping = true;
+                    o.horizontalScale = escala;
+                    o.verticalScale = escala;
+                    doc.exportFile(file, ExportType.PNG24, o);
+                } else {
+                    var j = new ExportOptionsJPEG();
+                    j.qualitySetting = cfg.calidadJPG;
+                    j.antiAliasing = true;
+                    j.artBoardClipping = true;
+                    j.horizontalScale = escala;
+                    j.verticalScale = escala;
+                    try { j.blurAmount = 0; } catch (e) {}
+                    doc.exportFile(file, ExportType.JPEG, j);
+                }
+            } finally {
+                if (capaFondo) capaFondo.remove();
+                if (k !== 1) escalar(doc, grupo, 1 / k);
+            }
+        }
+
+        function archivo(logo, formato, nombre) {
+            var ruta = raiz.fsName;
+            if (cfg.porLogo) { ruta += "/" + logo.nombre; crearCarpeta(ruta); }
+            ruta += "/" + formato;
+            crearCarpeta(ruta);
+            return new File(ruta + "/" + nombre);
+        }
+    }
+
+    // =====================================================
+    // 6.5 VISTA PREVIA DEL PAQUETE (= ARCHIVO MAESTRO)
+    //     Documento aparte, como una hoja de presentación de marca:
+    //     columnas = logos, filas = versiones de color.
+    //     Si hay varios formatos marcados, se repite la hoja por grupo
+    //     (Vectoriales → PNG → JPG) con más espacio entre grupos.
+    //
+    //     Para que sea rápido, los logos ya recoloreados se guardan en
+    //     una capa oculta "Base": al marcar o desmarcar un formato solo
+    //     se duplican, sin volver a recolorear.
+    // =====================================================
+
+    var MARCA_VISTA = "SuperExport · vista previa de: ";
+    var MARCA_VISTA_ANTIGUA = "LogoPack · vista previa de: ";
+    var PREFIJO_BASE = "Base SuperExport #";
+    var PREFIJO_GRUPO = "Grupo · ";
+
+    function esVista(d) {
+        try {
+            for (var i = 0; i < d.layers.length; i++) {
+                var nl = String(d.layers[i].name);
+                if (nl.indexOf(MARCA_VISTA) === 0 || nl.indexOf(MARCA_VISTA_ANTIGUA) === 0) return true;
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    function origenDeVista(d) {
+        for (var i = 0; i < d.layers.length; i++) {
+            var n = String(d.layers[i].name);
+            if (n.indexOf(MARCA_VISTA) === 0) return n.substr(MARCA_VISTA.length);
+            if (n.indexOf(MARCA_VISTA_ANTIGUA) === 0) return n.substr(MARCA_VISTA_ANTIGUA.length);
+        }
+        return "";
+    }
+
+    function vistaDe(src) {
+        for (var i = app.documents.length - 1; i >= 0; i--) {
+            var d = app.documents[i];
+            if (esVista(d) && origenDeVista(d) === src.name) return d;
+        }
+        return null;
+    }
+
+    function cerrarVistasDe(src) {
+        var d;
+        while ((d = vistaDe(src))) d.close(SaveOptions.DONOTSAVECHANGES);
+    }
+
+    function capaPorPrefijo(d, prefijo) {
+        for (var i = 0; i < d.layers.length; i++) {
+            if (String(d.layers[i].name).indexOf(prefijo) === 0) return d.layers[i];
+        }
+        return null;
+    }
+
+    function normalizarVersiones(cfg) {
+        var res = [], usados = {};
+        for (var a = 0; a < (cfg.versiones || []).length; a++) {
+            var ver = cfg.versiones[a];
+            var nom = limpiar(ver.nombre) || ("Version_" + (a + 1)), base = nom, nn = 2;
+            while (usados[nom.toLowerCase()]) { nom = base + "_" + nn; nn++; }
+            usados[nom.toLowerCase()] = true;
+            ver.nombre = nom;
+            res.push(ver);
+        }
+        if (!res.length) throw new Error("Marca al menos una versión de color (paso 2).");
+        return res;
+    }
+
+    function seccionesDe(cfg) {
+        var f = cfg.formatos || {}, s = [], vec = [];
+        var lista = ["AI", "PDF", "EPS", "SVG"];
+        for (var i = 0; i < lista.length; i++) if (f[lista[i]]) vec.push(lista[i]);
+        if (vec.length) s.push({ id: "VECTOR", titulo: "Vectoriales  ·  " + vec.join(" · "), fondo: false });
+        if (f.PNG) s.push({ id: "PNG", titulo: "PNG  ·  " + TAM_IMAGEN + " px  ·  fondo transparente", fondo: false });
+        if (f.JPG) s.push({ id: "JPG", titulo: "JPG  ·  " + TAM_IMAGEN + " px  ·  calidad " + cfg.calidadJPG + " %", fondo: true });
+        if (!s.length) s.push({ id: "LOGOS", titulo: "Logos  ·  marca formatos en el paso 3 para ver cada grupo", fondo: false });
+        return s;
+    }
+
+    // Huella corta de todo lo que cambia el aspecto de los logos
+    function huella(lista, versiones, cfg) {
+        var t = (cfg.margen) + "|" + (cfg.contornos ? 1 : 0);
+        for (var i = 0; i < lista.length; i++) {
+            var b = lista[i].visibleBounds;
+            t += "|" + lista[i].name + ":" + Math.round(b[2] - b[0]) + "x" + Math.round(b[1] - b[3]) + ":" + lista[i].pageItems.length;
+        }
+        for (var v = 0; v < versiones.length; v++) {
+            var ver = versiones[v];
+            t += "|" + ver.nombre + ":" + ver.tipo + ":" + ver.regla + ":" + ver.fondo + ":" + (ver.tinta || "") + ":" + (ver.papel || "") + ":" + (ver.fondoColor || "") + ":" + (ver.baseRegla || "");
+            for (var kb = 0; kb < (ver.baseMapa || []).length; kb++) t += ":b" + ver.baseMapa[kb][0] + ">" + ver.baseMapa[kb][1];
+            for (var k = 0; k < (ver.mapa || []).length; k++) t += ":" + ver.mapa[k][0] + ">" + ver.mapa[k][1];
+        }
+        var h = 5381;
+        for (var c = 0; c < t.length; c++) h = ((h * 33) ^ t.charCodeAt(c)) % 2147483647;
+        return String(Math.abs(h));
+    }
+
+    function construirVistaPaquete(src, cfg) {
+        var C = crearColores(src.documentColorSpace === DocumentColorSpace.CMYK);
+        var lista = logosDe(src);
+        if (!lista.length) throw new Error("Primero agrega logos en el paso 1.");
+        var versionesBase = normalizarVersiones(cfg);
+        // Todas las versiones que se dibujan: las normales + fondos de marca (solo en el grupo JPG)
+        var versiones = versionesBase.concat(versionesDeFondo(cfg));
+        var secciones = seccionesDe(cfg);
+        cfg.margen = 0;   // el logo toca los bordes de su mesa
+        var margen = 0;
+        var firma = huella(lista, versiones, cfg);
+
+        // ---- Reutilizar el documento si los logos y versiones no cambiaron ----
+        var doc = vistaDe(src), nuevo = false, capaBase = null;
+        if (doc) {
+            capaBase = capaPorPrefijo(doc, PREFIJO_BASE);
+            if (cfg.forzar || !capaBase || capaBase.name !== PREFIJO_BASE + firma) {
+                cerrarVistasDe(src);
+                doc = null;
+            }
+        }
+        if (!doc) {
+            nuevo = true;
+            doc = app.documents.add(src.documentColorSpace, 500, 500);
+            doc.layers[0].name = MARCA_VISTA + src.name;
+            capaBase = doc.layers.add();
+            capaBase.name = PREFIJO_BASE + firma;
+            construirBase(doc, capaBase, lista, versiones, C, cfg);
+            capaBase.visible = false;
+        } else {
+            app.activeDocument = doc;
+        }
+
+        // Mapa de las copias base: "l|v" -> grupo
+        var base = {};
+        capaBase.visible = true;
+        for (var b0 = 0; b0 < capaBase.pageItems.length; b0++) base[capaBase.pageItems[b0].name] = capaBase.pageItems[b0];
+
+        // ---- Borrar grupos anteriores y sus mesas ----
+        for (var q = doc.layers.length - 1; q >= 0; q--) {
+            if (String(doc.layers[q].name).indexOf(PREFIJO_GRUPO) === 0) {
+                doc.layers[q].locked = false;
+                doc.layers[q].remove();
+            }
+        }
+        while (doc.artboards.length > 1) doc.artboards.remove(doc.artboards.length - 1);
+
+        // ---- Medidas: cada columna se ajusta a su logo; cada fila a su logo más alto ----
+        var BASE_MAX = 240;
+        var escala = escalaComun(lista, BASE_MAX);
+        var m = BASE_MAX * margen / 100;
+        var anchos = [], altoFila = 0, i, l, v;
+        for (l = 0; l < lista.length; l++) {
+            var bl = limites(lista[l]);
+            anchos.push((bl[2] - bl[0]) * escala + 2 * m);
+            altoFila = Math.max(altoFila, (bl[1] - bl[3]) * escala + 2 * m);
+        }
+        var altos = [];
+        for (l = 0; l < lista.length; l++) {
+            var bl2 = limites(lista[l]);
+            altos.push((bl2[1] - bl2[3]) * escala + 2 * m);
+        }
+        var sep = Math.max(14, Math.min(40, Math.round(altoFila * 0.12)));
+        var sepGrupo = sep * 4;
+        var tamTitulo = Math.max(14, Math.min(26, altoFila * 0.1));
+        var tamEtiqueta = Math.max(8, Math.round(tamTitulo * 0.55));
+
+        var x0 = 0, y = 0, usadas = 0;
+        var r0 = doc.artboards[0].artboardRect;
+        x0 = r0[0]; y = r0[1];
+
+        for (var s = 0; s < secciones.length; s++) {
+            var sec = secciones[s];
+            var capa = doc.layers.add();
+            capa.name = PREFIJO_GRUPO + sec.id;
+            var capaFondo = capa.layers.add();
+            capaFondo.name = sec.fondo ? "Fondos JPG" : "Fondo de referencia (no se imprime)";
+            var capaTit = capa.layers.add();
+            capaTit.name = "Títulos (no se imprimen)";
+            capaFondo.zOrder(ZOrderMethod.SENDTOBACK);
+
+            texto(capaTit, sec.titulo, x0, y, tamTitulo, "izq");
+            y -= tamTitulo * 1.7;
+
+            // Nombres de los logos arriba de cada columna
+            var x = x0;
+            for (l = 0; l < lista.length; l++) {
+                texto(capaTit, lista[l].name, x, y, tamEtiqueta, "izq");
+                x += anchos[l] + sep;
+            }
+            y -= tamEtiqueta * 1.8;
+
+            for (v = 0; v < versiones.length; v++) {
+                if (versiones[v].soloJPG && sec.id !== "JPG") continue;
+                // Nombre de la versión a la izquierda de la fila
+                texto(capaTit, versiones[v].nombre, x0 - sep * 0.6, y, tamEtiqueta, "der");
+                x = x0;
+                var oscuro = (versiones[v].fondo === "oscuro");
+                for (l = 0; l < lista.length; l++) {
+                    var r = [x, y, x + anchos[l], y - altos[l]];
+                    var orig = base[l + "|" + v];
+                    if (orig) {
+                        var item = orig.duplicate(capa, ElementPlacement.PLACEATBEGINNING);
+                        var bi = item.visibleBounds;
+                        item.translate((r[0] + r[2]) / 2 - (bi[0] + bi[2]) / 2, (r[1] + r[3]) / 2 - (bi[1] + bi[3]) / 2);
+                        item.name = sec.id + " · " + lista[l].name + " · " + versiones[v].nombre;
+                    }
+                    var ab = (usadas === 0) ? doc.artboards[0] : doc.artboards.add(r);
+                    ab.artboardRect = r;
+                    ab.name = sec.id + "_" + limpiar(lista[l].name) + "_" + versiones[v].nombre;
+                    usadas++;
+                    if (sec.fondo) rectangulo(capaFondo, r, fondoDe(versiones[v], doc, C));
+                    else if (oscuro) rectangulo(capaFondo, r, C.fondoOscuro());
+                    x += anchos[l] + sep;
+                }
+                y -= altoFila + sep;
+            }
+            y += sep;
+            y -= sepGrupo;
+
+            try { capaTit.printable = false; capaTit.locked = true; } catch (eT) {}
+            if (!sec.fondo) { try { capaFondo.printable = false; } catch (eP) {} }
+            if (capaFondo.pageItems.length === 0) capaFondo.remove(); else capaFondo.locked = true;
+        }
+
+        capaBase.visible = false;
+        try {
+            var marca = capaPorPrefijo(doc, MARCA_VISTA);
+            marca.visible = false;
+            marca.locked = true;
+        } catch (eM) {}
+        if (nuevo) { try { app.executeMenuCommand("fitall"); } catch (eF) {} }
+        app.redraw();
+        return { doc: doc, mesas: usadas, secciones: secciones.length };
+
+        function texto(capa, contenido, x, yTop, tam, alineacion) {
+            var tf = capa.textFrames.add();
+            tf.contents = contenido;
+            try {
+                tf.textRange.characterAttributes.size = tam;
+                var gr = new GrayColor(); gr.gray = 55;
+                tf.textRange.characterAttributes.fillColor = gr;
+            } catch (e) {}
+            tf.position = [alineacion === "der" ? x - tf.width : x, yTop];
+            return tf;
+        }
+
+        function rectangulo(capa, r, color) {
+            var p = capa.pathItems.rectangle(r[1], r[0], r[2] - r[0], r[1] - r[3]);
+            p.stroked = false;
+            p.filled = true;
+            p.fillColor = color;
+            return p;
+        }
+    }
+
+    // Factor para que el logo más grande mida "maximo" por su lado mayor,
+    // manteniendo las proporciones entre logos (como en el archivo original)
+    function escalaComun(lista, maximo) {
+        var mayor = 0;
+        for (var i = 0; i < lista.length; i++) {
+            var b = limites(lista[i]);
+            mayor = Math.max(mayor, b[2] - b[0], b[1] - b[3]);
+        }
+        return mayor > 0 ? maximo / mayor : 1;
+    }
+
+    // Copias recoloreadas de cada logo en cada versión (lo único costoso; se hace una vez)
+    function construirBase(doc, capaBase, lista, versiones, C, cfg) {
+        var escala = escalaComun(lista, 240) * 100;
+        for (var l = 0; l < lista.length; l++) {
+            for (var v = 0; v < versiones.length; v++) {
+                var g = copiarConVersion(lista[l], capaBase, versiones[v], C, doc, cfg.contornos);
+                g.resize(escala, escala, true, true, true, true, escala, Transformation.CENTER);
+                g.name = l + "|" + v;
+            }
+        }
+    }
+
+    // Copia un logo dentro de una capa, como grupo, con la versión de color aplicada
+    function copiarConVersion(logoItem, capa, ver, C, doc, contornos) {
+        var g = capa.groupItems.add();
+        var copia = logoItem.duplicate(capa, ElementPlacement.PLACEATBEGINNING);
+        copia.move(g, ElementPlacement.PLACEATBEGINNING);
+        try { copia.note = ""; } catch (eN) {}
+        if (contornos) {
+            for (var t = g.textFrames.length - 1; t >= 0; t--) { try { g.textFrames[t].createOutline(); } catch (eT) {} }
+        }
+        if (ver.tipo !== "original") {
+            try {
+                if (g.rasterItems.length || g.placedItems.length)
+                    avisar("Hay imágenes dentro de algún logo: no cambian de color en las versiones.");
+                if (g.symbolItems.length)
+                    avisar("Hay símbolos dentro de algún logo: rompe el vínculo para que cambien de color.");
+            } catch (eR) {}
+        }
+        aplicarEnGrupo(g, ver, C, doc);
+        return g;
+    }
+
+    function vaciarDocumento(doc) {
+        for (var i = doc.layers.length - 1; i >= 0; i--) {
+            var capa = doc.layers[i];
+            capa.locked = false;
+            capa.visible = true;
+            if (i > 0) { capa.remove(); continue; }
+            while (capa.pageItems.length) capa.pageItems[0].remove();
+        }
+    }
+
+    // ---------- 6.4 Opciones de calidad por formato ----------
+    function opcionesAI() {
+        var o = new IllustratorSaveOptions();
+        o.pdfCompatible = true;
+        o.compressed = true;
+        try { o.embedICCProfile = true; } catch (e) {}
+        try { o.embedLinkedFiles = true; } catch (e2) {}
+        return o;
+    }
+
+    function opcionesEPS() {
+        var o = new EPSSaveOptions();
+        o.embedAllFonts = true;
+        try { o.embedLinkedFiles = true; } catch (e) {}
+        try { o.includeDocumentThumbnails = true; } catch (e2) {}
+        try { o.cmykPostScript = true; } catch (e3) {}
+        try { o.preview = EPSPreview.COLORTIFF; } catch (e4) {}
+        return o;
+    }
+
+    function opcionesPDF() {
+        var o = new PDFSaveOptions();
+        o.preserveEditability = false;
+        o.viewAfterSaving = false;
+        try { o.generateThumbnails = true; } catch (e) {}
+        try { o.compatibility = PDFCompatibility.ACROBAT7; } catch (e1) {}
+        try {
+            o.colorDownsamplingMethod = DownsampleMethod.NODOWNSAMPLE;
+            o.grayscaleDownsamplingMethod = DownsampleMethod.NODOWNSAMPLE;
+            o.monochromeDownsamplingMethod = DownsampleMethod.NODOWNSAMPLE;
+        } catch (e2) {}
+        try {
+            o.colorCompression = CompressionQuality.ZIP8BIT;
+            o.grayscaleCompression = CompressionQuality.ZIP8BIT;
+        } catch (e3) {}
+        return o;
+    }
+
+    function opcionesSVG() {
+        var o = new ExportOptionsSVG();
+        o.embedRasterImages = true;
+        o.fontType = SVGFontType.OUTLINEFONT;
+        o.coordinatePrecision = 3;
+        o.cssProperties = SVGCSSPropertyLocation.STYLEATTRIBUTES;
+        o.documentEncoding = SVGDocumentEncoding.UTF8;
+        return o;
+    }
+
+    // =====================================================
+    // 7. API PÚBLICA
+    // =====================================================
+
+    var API = {};
+
+    API.listar = function () {
+        return resumenLista(docActivo());
+    };
+
+    API.agregar = function (nombre, op) {
+        var d = docActivo();
+        if (esVista(app.activeDocument)) {
+            app.activeDocument = d;
+            throw new Error("Te llevé a tu archivo original: selecciona allí el logo y vuelve a pulsar «Agregar logo».");
+        }
+        op = opcionesPorDefecto(op);
+        var sel = d.selection;
+        if (!sel || sel.typename || !sel.length) {
+            throw new Error("Primero selecciona en tu mesa de trabajo el logo que quieres agregar.");
+        }
+
+        // Objetos de primer nivel seleccionados (sin repetir)
+        var tops = [], vistos = {};
+        for (var i = 0; i < sel.length; i++) {
+            var it = nivelSuperior(sel[i]);
+            var clave = it.typename + "|" + it.visibleBounds.join(",");
+            if (vistos[clave]) continue;
+            vistos[clave] = true;
+            if (esLogo(it)) throw new Error("\"" + it.name + "\" ya está en la lista de logos.");
+            tops.push(it);
+        }
+
+        // Si son varias piezas, se agrupan en un solo logo
+        var g;
+        if (tops.length === 1 && tops[0].typename === "GroupItem") {
+            g = tops[0];
+        } else {
+            g = tops[0].layer.groupItems.add();
+            g.move(tops[0], ElementPlacement.PLACEBEFORE);
+            for (var k = 0; k < tops.length; k++) tops[k].move(g, ElementPlacement.PLACEATEND);
+        }
+
+        var lista = logosDe(d);
+        var base = limpiar(nombre) || limpiar(g.name) || ("Logo_" + dosDigitos(lista.length + 1));
+        g.name = nombreLibre(lista, base, g);
+
+        var origen = leerOrigen(lista) || calcularOrigen(d);
+        lista.push(g);
+        escribirNotas(lista, origen);
+        acomodar(d, lista, origen, op);
+
+        d.selection = null;
+        var idx = buscarMesa(d, g.name);
+        if (idx >= 0) d.artboards.setActiveArtboardIndex(idx);
+        app.redraw();
+
+        var r = resumenLista(d);
+        r.mensaje = "Agregado: " + g.name + " (mesa de trabajo creada).";
+        r.seleccion = r.logos.length - 1;
+        return r;
+    };
+
+    API.quitar = function (indice, op) {
+        var d = docActivo();
+        op = opcionesPorDefecto(op);
+        var lista = logosDe(d);
+        var g = lista[indice];
+        if (!g) throw new Error("Elige un logo de la lista.");
+        var origen = leerOrigen(lista) || calcularOrigen(d);
+
+        var idx = buscarMesa(d, g.name);
+        if (idx >= 0 && d.artboards.length > 1) d.artboards.remove(idx);
+        g.note = "";
+
+        // Se aparta a la izquierda de la cuadrícula para que no quede encima de otro logo
+        var b = limites(g);
+        g.translate((origen[0] - op.separacion * 2) - b[2], origen[1] - b[1]);
+
+        lista.splice(indice, 1);
+        escribirNotas(lista, origen);
+        acomodar(d, lista, origen, op);
+        app.redraw();
+
+        var r = resumenLista(d);
+        r.mensaje = "Quitado de la lista: " + g.name + ". El logo sigue en tu archivo, a la izquierda de la cuadrícula.";
+        r.seleccion = Math.min(indice, r.logos.length - 1);
+        return r;
+    };
+
+    API.renombrar = function (indice, nombre) {
+        var d = docActivo();
+        var lista = logosDe(d);
+        var g = lista[indice];
+        if (!g) throw new Error("Elige un logo de la lista.");
+        var nuevo = limpiar(nombre);
+        if (!nuevo) throw new Error("Escribe un nombre válido.");
+        nuevo = nombreLibre(lista, nuevo, g);
+        var idx = buscarMesa(d, g.name);
+        if (idx >= 0) d.artboards[idx].name = nuevo;
+        g.name = nuevo;
+        var r = resumenLista(d);
+        r.mensaje = "Renombrado a " + nuevo + ".";
+        r.seleccion = indice;
+        return r;
+    };
+
+    API.mover = function (indice, direccion, op) {
+        var d = docActivo();
+        op = opcionesPorDefecto(op);
+        var lista = logosDe(d);
+        var destino = indice + direccion;
+        if (!lista[indice] || destino < 0 || destino >= lista.length) {
+            var r0 = resumenLista(d);
+            r0.seleccion = indice;
+            return r0;
+        }
+        var tmp = lista[indice];
+        lista[indice] = lista[destino];
+        lista[destino] = tmp;
+        var origen = leerOrigen(lista) || calcularOrigen(d);
+        escribirNotas(lista, origen);
+        acomodar(d, lista, origen, op);
+        app.redraw();
+        var r = resumenLista(d);
+        r.mensaje = "Orden actualizado.";
+        r.seleccion = destino;
+        return r;
+    };
+
+    API.reordenar = function (op) {
+        var d = docActivo();
+        op = opcionesPorDefecto(op);
+        var lista = logosDe(d);
+        if (!lista.length) throw new Error("Todavía no hay logos en la lista.");
+        var origen = leerOrigen(lista) || calcularOrigen(d);
+        escribirNotas(lista, origen);
+        acomodar(d, lista, origen, op);
+        app.redraw();
+        var r = resumenLista(d);
+        r.mensaje = "Mesas de trabajo reordenadas (" + op.columnas + " columnas).";
+        return r;
+    };
+
+    API.enfocar = function (indice) {
+        var d = docActivo();
+        traerAlFrente(d);
+        var lista = logosDe(d);
+        var g = lista[indice];
+        if (!g) return resumenLista(d);
+        d.selection = null;
+        try { g.selected = true; } catch (e) {}
+        var idx = buscarMesa(d, g.name);
+        if (idx >= 0) {
+            d.artboards.setActiveArtboardIndex(idx);
+            try { app.executeMenuCommand("fitin"); } catch (e2) {}
+        }
+        app.redraw();
+        var r = resumenLista(d);
+        r.seleccion = indice;
+        return r;
+    };
+
+    API.limpiarMesas = function () {
+        var d = docActivo();
+        var lista = logosDe(d);
+        if (!lista.length) throw new Error("Primero agrega logos; si no, el archivo se quedaría sin mesas útiles.");
+        var nombres = {};
+        for (var i = 0; i < lista.length; i++) nombres[lista[i].name] = true;
+        var n = 0;
+        for (var k = d.artboards.length - 1; k >= 0; k--) {
+            if (!nombres[d.artboards[k].name] && d.artboards.length > 1) { d.artboards.remove(k); n++; }
+        }
+        app.redraw();
+        var r = resumenLista(d);
+        r.mensaje = n + " mesas de trabajo eliminadas (las que no eran de ningún logo).";
+        return r;
+    };
+
+    // Colores que usa un logo (indice = -1: todos los logos juntos)
+    API.colores = function (indice) {
+        var d = docActivo();
+        var lista = logosDe(d);
+        if (!lista.length) throw new Error("Primero agrega logos en el paso 1.");
+        var items = (indice >= 0 && lista[indice]) ? [lista[indice]] : lista;
+        var vistos = {}, colores = [];
+        for (var i = 0; i < items.length; i++) {
+            var c = detectarColores(items[i]);
+            for (var k = 0; k < c.length; k++) {
+                if (vistos[c[k].clave]) continue;
+                vistos[c[k].clave] = true;
+                colores.push(c[k]);
+            }
+        }
+        colores.sort(function (a, b) { return b.gris - a.gris; });
+        var r = resumenLista(d);
+        r.colores = colores;
+        r.mensaje = colores.length + " colores detectados.";
+        return r;
+    };
+
+    // Genera una miniatura PNG de un logo por cada versión de color
+    API.vistas = function (indice, versiones, tam) {
+        var d = docActivo();
+        var lista = logosDe(d);
+        var g = lista[indice] || lista[0];
+        if (!g) throw new Error("Primero agrega logos en el paso 1.");
+        tam = parseInt(tam, 10) || 110;
+        var C = crearColores(d.documentColorSpace === DocumentColorSpace.CMYK);
+
+        // (las miniaturas viejas las borra el panel cuando las reemplaza)
+
+        var sello = new Date().getTime(), rutas = [];
+        var previo = app.activeDocument;
+        var nivel = app.userInteractionLevel;
+        app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
+        // Un solo documento temporal para todas las miniaturas
+        var tdoc = app.documents.add(d.documentColorSpace, 500, 500);
+        try {
+            for (var i = 0; i < versiones.length; i++) {
+                var ruta = "";
+                try {
+                    vaciarDocumento(tdoc);
+                    var capa = tdoc.layers[0];
+                    var grupo = copiarConVersion(g, capa, versiones[i], C, tdoc, false);
+                    // Miniatura cuadrada: siempre del mismo tamaño en el panel
+                    var bl = conMargen(limites(grupo), 8);
+                    var lado = Math.max(bl[2] - bl[0], bl[1] - bl[3]);
+                    var cx = (bl[0] + bl[2]) / 2, cy = (bl[1] + bl[3]) / 2;
+                    var b = [cx - lado / 2, cy + lado / 2, cx + lado / 2, cy - lado / 2];
+                    tdoc.artboards[0].artboardRect = b;
+                    var rect = capa.pathItems.rectangle(b[1], b[0], b[2] - b[0], b[1] - b[3]);
+                    rect.stroked = false;
+                    rect.filled = true;
+                    rect.fillColor = (versiones[i].fondo === "oscuro") ? C.fondoOscuro() : C.fondoClaro();
+                    rect.zOrder(ZOrderMethod.SENDTOBACK);
+
+                    var o = new ExportOptionsPNG24();
+                    o.transparency = false;
+                    o.antiAliasing = true;
+                    o.artBoardClipping = true;
+                    var esc = tam / Math.max(b[2] - b[0], b[1] - b[3]) * 100;
+                    o.horizontalScale = esc;
+                    o.verticalScale = esc;
+                    var f = new File(Folder.temp.fsName + "/SuperExport_vista_" + sello + "_" + i + ".png");
+                    tdoc.exportFile(f, ExportType.PNG24, o);
+                    ruta = f.fsName;
+                } catch (eV) {
+                    avisar("Vista previa de " + versiones[i].nombre + ": " + eV.message);
+                }
+                rutas.push(ruta);
+            }
+        } finally {
+            try { tdoc.close(SaveOptions.DONOTSAVECHANGES); } catch (eC) {}
+            app.userInteractionLevel = nivel;
+            try { app.activeDocument = previo; } catch (eA) {}
+        }
+        var res = resumenLista(d);
+        res.vistas = rutas;
+        return res;
+    };
+
+    // Abre el selector de color de Illustrator y devuelve el color elegido
+    API.elegirColor = function () {
+        var d = docActivo();
+        var marca = new RGBColor(); marca.red = 1; marca.green = 2; marca.blue = 3;
+        var c = app.showColorPicker(marca);
+        var r = resumenLista(d);
+        r.colores = [];
+        if (c && !(c.typename === "RGBColor" && c.red === 1 && c.green === 2 && c.blue === 3)) {
+            var k = claveColor(c);
+            if (k) r.colores.push({ clave: k, hex: hexDe(c), nombre: nombreColor(c), gris: valorGris(c) });
+        }
+        return r;
+    };
+
+    // Miniatura de cada logo registrado (colores originales), todas en un solo documento temporal
+    API.miniaturas = function (tam) {
+        var d = docActivo();
+        var lista = logosDe(d);
+        tam = parseInt(tam, 10) || 64;
+        var C = crearColores(d.documentColorSpace === DocumentColorSpace.CMYK);
+        var sello = new Date().getTime(), rutas = [];
+        var previo = app.activeDocument;
+        var nivel = app.userInteractionLevel;
+        app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
+        var tdoc = lista.length ? app.documents.add(d.documentColorSpace, 500, 500) : null;
+        try {
+            for (var i = 0; i < lista.length; i++) {
+                var ruta = "";
+                try {
+                    vaciarDocumento(tdoc);
+                    var capa = tdoc.layers[0];
+                    var grupo = copiarConVersion(lista[i], capa, { tipo: "original" }, C, tdoc, false);
+                    var bl = conMargen(limites(grupo), 10);
+                    var lado = Math.max(bl[2] - bl[0], bl[1] - bl[3]);
+                    var cx = (bl[0] + bl[2]) / 2, cy = (bl[1] + bl[3]) / 2;
+                    var b = [cx - lado / 2, cy + lado / 2, cx + lado / 2, cy - lado / 2];
+                    tdoc.artboards[0].artboardRect = b;
+                    var rect = capa.pathItems.rectangle(b[1], b[0], lado, lado);
+                    rect.stroked = false;
+                    rect.filled = true;
+                    rect.fillColor = C.fondoClaro();
+                    rect.zOrder(ZOrderMethod.SENDTOBACK);
+                    var o = new ExportOptionsPNG24();
+                    o.transparency = false;
+                    o.antiAliasing = true;
+                    o.artBoardClipping = true;
+                    o.horizontalScale = o.verticalScale = tam / lado * 100;
+                    var f = new File(Folder.temp.fsName + "/SuperExport_logo_" + sello + "_" + i + ".png");
+                    tdoc.exportFile(f, ExportType.PNG24, o);
+                    ruta = f.fsName;
+                } catch (eM) {
+                    avisar("Miniatura de " + lista[i].name + ": " + eM.message);
+                }
+                rutas.push(ruta);
+            }
+        } finally {
+            if (tdoc) { try { tdoc.close(SaveOptions.DONOTSAVECHANGES); } catch (eC) {} }
+            app.userInteractionLevel = nivel;
+            try { app.activeDocument = previo; } catch (eA) {}
+        }
+        var res = resumenLista(d);
+        res.vistas = rutas;
+        return res;
+    };
+
+    // Construye (o reconstruye) la vista previa del paquete en un documento aparte
+    API.paquete = function (cfg) {
+        var d = docActivo();
+        // Actualización automática: si la vista previa no está abierta, no se abre sola
+        if (cfg.soloSiAbierta && !vistaDe(d)) return resumenLista(d);
+        var nivel = app.userInteractionLevel;
+        app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
+        var vp;
+        try { vp = construirVistaPaquete(d, cfg); }
+        finally { app.userInteractionLevel = nivel; }
+        var r = resumenLista(d);
+        r.mensaje = "Vista previa lista: " + vp.mesas + " mesas de trabajo en " + vp.secciones +
+                    (vp.secciones === 1 ? " grupo." : " grupos.");
+        return r;
+    };
+
+    // Cierra la vista previa y vuelve al archivo original
+    API.cerrarPaquete = function () {
+        var d = docActivo();
+        cerrarVistasDe(d);
+        app.activeDocument = d;
+        var r = resumenLista(d);
+        r.mensaje = "Vista previa cerrada.";
+        return r;
+    };
+
+    API.exportar = function (cfg) {
+        var d = docActivo();
+        avisos = {};
+        var res = exportarPaquete(d, cfg);
+        var lista = [];
+        for (var k in avisos) { if (avisos.hasOwnProperty(k)) lista.push("• " + k); }
+        var r = resumenLista(d);
+        r.mensaje = "Paquete listo: " + res.total + " archivos en\n" + res.carpeta +
+                    (lista.length ? "\n\nAvisos:\n" + lista.join("\n") : "");
+        return r;
+    };
+
+    // Punto de entrada único para cualquier interfaz
+    function ejecutar(nombre, args) {
+        var previo = app.coordinateSystem;
+        var res;
+        avisos = {};
+        try {
+            app.coordinateSystem = CoordinateSystem.DOCUMENTCOORDINATESYSTEM;
+            if (!API[nombre]) throw new Error("Función desconocida: " + nombre);
+            res = API[nombre].apply(null, args || []) || {};
+            res.ok = true;
+        } catch (e) {
+            res = { ok: false, error: e.message + (e.line ? " (línea " + e.line + ")" : "") };
+        } finally {
+            app.coordinateSystem = previo;
+        }
+        registrar(nombre, res);
+        return serializar(res);
+    }
+
+    // Respuesta en texto simple y seguro: clave=valor&clave=valor (sin caracteres especiales)
+    function serializar(o) {
+        var partes = [];
+        partes.push("ok=" + (o.ok ? "1" : "0"));
+        var campos = ["error", "mensaje", "documento", "carpeta"];
+        for (var i = 0; i < campos.length; i++) {
+            if (o[campos[i]] !== undefined) partes.push(campos[i] + "=" + encodeURIComponent(String(o[campos[i]])));
+        }
+        if (typeof o.seleccion === "number") partes.push("seleccion=" + o.seleccion);
+        if (o.colores) {
+            var cs = [];
+            for (var c = 0; c < o.colores.length; c++) {
+                cs.push(encodeURIComponent(o.colores[c].clave) + ";" + o.colores[c].hex + ";" +
+                        encodeURIComponent(o.colores[c].nombre) + ";" + Math.round(o.colores[c].gris));
+            }
+            partes.push("colores=" + cs.join(","));
+        }
+        if (o.vistas) {
+            var vs = [];
+            for (var v = 0; v < o.vistas.length; v++) vs.push(encodeURIComponent(o.vistas[v]));
+            partes.push("vistas=" + vs.join(","));
+        }
+        if (o.logos) {
+            var l = [];
+            for (var k = 0; k < o.logos.length; k++) l.push(encodeURIComponent(String(o.logos[k])));
+            partes.push("logos=" + l.join(","));
+        }
+        return partes.join("&");
+    }
+
+    // Registro de errores en el Escritorio (SuperExport_registro.txt) para poder diagnosticar
+    function registrar(nombre, res) {
+        try {
+            var hayAvisos = false;
+            for (var k in avisos) { if (avisos.hasOwnProperty(k)) { hayAvisos = true; break; } }
+            if (res.ok && !hayAvisos) return;
+            var f = new File(Folder.desktop.fsName + "/SuperExport_registro.txt");
+            f.encoding = "UTF-8";
+            f.open("a");
+            f.writeln("[" + new Date().toString() + "] " + nombre + " | Illustrator " + app.version);
+            if (!res.ok) f.writeln("  ERROR: " + res.error);
+            for (var a in avisos) { if (avisos.hasOwnProperty(a)) f.writeln("  AVISO: " + a); }
+            f.close();
+        } catch (e) {}
+    }
+
+    return { ejecutar: ejecutar, version: VERSION_MOTOR };
+})();

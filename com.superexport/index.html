@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SuperExport</title>
+  <link rel="stylesheet" href="css/superexport.css">
+</head>
+<body>
+
+  <!-- ============ ENCABEZADO ============ -->
+  <header class="top">
+    <img class="logo-cabecera" src="img/super-export.svg" alt="Super Export by Edgar Quintero">
+    <span class="punto" id="indicador" title="Estado"></span>
+  </header>
+
+  <!-- ============ PASOS ============ -->
+  <nav class="pasos" id="pasos">
+    <button data-paso="1" class="activo"><i>01</i>Logos</button>
+    <button data-paso="2"><i>02</i>Color</button>
+    <button data-paso="3"><i>03</i>Formatos</button>
+    <button data-paso="4"><i>04</i>Exportar</button>
+  </nav>
+
+  <main id="contenido">
+
+    <!-- ============ PASO 1 · LOGOS ============ -->
+    <section class="paso activo" id="paso1">
+      <h2>Tus logos</h2>
+      <p class="intro">Cada logo recibe su mesa de trabajo, ordenada y a su medida.</p>
+
+      <div class="bloque">
+        <ol class="guia">
+          <li>Selecciona un logo en tu mesa de trabajo.</li>
+          <li>Ponle nombre (Horizontal, Isotipo…).</li>
+          <li>Agrégalo.</li>
+        </ol>
+        <div class="fila">
+          <input type="text" id="nombreLogo" class="crece" placeholder="Nombre del logo">
+          <button class="btn principal" id="btAgregar">Agregar</button>
+        </div>
+      </div>
+
+      <h3 class="subtitulo"><span>Logos del paquete</span><span class="cuenta" id="cuentaLogos">0</span></h3>
+      <ul class="lista" id="listaLogos"></ul>
+      <div class="acciones">
+        <button class="btn" id="btSubir" title="Subir">↑ Subir</button>
+        <button class="btn" id="btBajar" title="Bajar">↓ Bajar</button>
+        <button class="btn peligro" id="btQuitar">Quitar</button>
+      </div>
+
+      <h3 class="subtitulo"><span>Orden de las mesas</span></h3>
+      <div class="bloque">
+        <div class="fila">
+          <span class="crece">Columnas</span>
+          <div class="contador"><button id="colMenos">−</button><output id="columnas">3</output><button id="colMas">+</button></div>
+        </div>
+        <div class="fila">
+          <span class="crece">Separación (pt)</span>
+          <input type="number" id="separacion" min="0" step="5" style="width:80px">
+        </div>
+        <div class="btns" style="margin-top:12px">
+          <button class="btn" id="btReordenar">Reordenar</button>
+          <button class="btn peligro" id="btLimpiar">Borrar mesas sin logo</button>
+        </div>
+        <p class="nota">Cada mesa toma la forma exacta de su logo, sin margen.</p>
+      </div>
+    </section>
+
+    <!-- ============ PASO 2 · COLOR ============ -->
+    <section class="paso" id="paso2">
+      <h2>Esquemas de color</h2>
+      <p class="intro">Marca los que van en el paquete. Todo se actualiza solo mientras ajustas.</p>
+
+      <div class="fila" style="margin-bottom:12px">
+        <span>Ver con</span>
+        <select id="logoPrevia" class="crece"></select>
+      </div>
+
+      <div class="esquemas" id="esquemas"></div>
+      <div class="fila" style="margin:12px 0">
+        <label class="interruptor crece"><input type="checkbox" id="tintasMarca"><span class="riel"></span><span>Una versión por color de marca</span></label>
+        <button class="btn mini" id="btNuevoEsquema">+ Propio</button>
+      </div>
+
+      <div id="ajuste"></div>
+
+      <h3 class="subtitulo"><span>Colores de la marca</span><span class="cuenta" id="cuentaColores"></span></h3>
+      <div class="bloque">
+        <div class="paleta" id="paleta"></div>
+        <div class="fila" style="margin-top:10px">
+          <input type="text" id="hexNuevo" class="crece" placeholder="#FF762C" maxlength="7">
+          <button class="btn" id="btHex">+ HEX</button>
+        </div>
+        <div class="btns" style="margin-top:8px">
+          <button class="btn" id="btSelector">+ Selector de color</button>
+          <button class="btn" id="btDelLogo">Tomar del logo</button>
+        </div>
+        <p class="nota">Se usan para las versiones en color de marca y para los fondos JPG.</p>
+      </div>
+    </section>
+
+    <!-- ============ PASO 3 · FORMATOS ============ -->
+    <section class="paso" id="paso3">
+      <h2>Formatos</h2>
+      <p class="intro">Al marcar un formato se abre la vista previa del paquete con sus mesas.</p>
+
+      <div class="formatos" id="formatos"></div>
+
+      <div class="btns parejos" style="margin:12px 0">
+        <button class="btn" id="btVerPaquete">Ver vista previa</button>
+        <button class="btn" id="btCerrarPaquete">Cerrar</button>
+      </div>
+
+      <h3 class="subtitulo"><span>JPG</span></h3>
+      <div class="bloque">
+        <div class="fila">
+          <span>Calidad</span>
+          <input type="range" id="calidadJPG" min="10" max="100" step="1" class="crece">
+          <span class="valor" id="calidadValor">100%</span>
+        </div>
+        <div class="etiqueta"><span>Fondos de color de marca</span></div>
+        <div class="fondos" id="fondosJPG"></div>
+        <p class="nota">Sobre fondos oscuros el logo va en blanco; sobre claros, en negro.</p>
+      </div>
+
+      <h3 class="subtitulo"><span>Al exportar, guardar también</span></h3>
+      <div class="bloque">
+        <label class="casilla"><input type="checkbox" id="maestroAI"><span class="caja"></span><span>Archivo maestro .ai (la vista previa)</span></label>
+        <div style="height:8px"></div>
+        <label class="casilla"><input type="checkbox" id="maestroPDF"><span class="caja"></span><span>PDF con todas las mesas</span></label>
+        <div style="height:8px"></div>
+        <label class="casilla"><input type="checkbox" id="contornos"><span class="caja"></span><span>Convertir textos a contornos</span></label>
+        <p class="nota">PNG y JPG: 1200 px por el lado más largo. AI, PDF y EPS quedan vectoriales.</p>
+      </div>
+    </section>
+
+    <!-- ============ PASO 4 · EXPORTAR ============ -->
+    <section class="paso" id="paso4">
+      <h2>Exportar</h2>
+      <p class="intro">Revisa y genera el paquete completo.</p>
+
+      <div class="bloque">
+        <div class="etiqueta"><span>Nombre de la marca</span></div>
+        <input type="text" id="nombreMarca" placeholder="Marca">
+        <div class="etiqueta"><span>Carpeta de destino</span></div>
+        <div class="fila">
+          <div class="ruta crece" id="ruta">Escritorio</div>
+          <button class="btn mini" id="btCarpeta">Cambiar</button>
+        </div>
+        <div class="etiqueta"><span>Organizar carpetas</span></div>
+        <div class="segmentos" id="organizacion">
+          <button data-v="logo" class="activo">Por logo</button>
+          <button data-v="formato">Por formato</button>
+        </div>
+      </div>
+
+      <div class="resumen" id="resumen"></div>
+      <ul class="extras" id="extras"></ul>
+
+      <button class="btn principal grande" id="btExportar">Generar paquete</button>
+    </section>
+  </main>
+
+  <!-- ============ BARRA DE ESTADO ============ -->
+  <footer class="estado" id="estado"><span class="punto" id="puntoEstado"></span><span id="estadoTexto">Listo.</span></footer>
+
+  <!-- ============ CONFIRMACIONES ============ -->
+  <div class="modal" id="modal" hidden>
+    <div class="caja-modal">
+      <p id="modalTexto"></p>
+      <div class="btns">
+        <button class="btn" id="modalNo">Cancelar</button>
+        <button class="btn principal" id="modalSi">Aceptar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/puente.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
